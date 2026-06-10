@@ -53,6 +53,7 @@ static SLIST_HEADER PhpTrayIconWorkQueueListHead;
 #endif
 static ULONG PopupIconIndex = ULONG_MAX; // Win11 workaround (dmex)
 static PPH_NF_ICON PopupRegisteredIcon = NULL; // Win11 workaround (dmex)
+static BOOLEAN PopupTimerPending = FALSE; // Win11 workaround: hover-delay timer armed, not yet matured (zvirja)
 
 VOID PhNfLoadStage1(
     VOID
@@ -567,15 +568,21 @@ VOID PhNfForwardMessage(
             {
                 // NIN_POPUPOPEN is sent when the user hovers the cursor over an icon BUT Windows 11 either blocks the notification
                 // or ignores the hover time and displays the popup instantly. We try and workaround the missing hover time by using
-                // a timer to delay the popup for 1 second. If we get a NIN_POPUPCLOSE then cancel the timer and the popup.
-                // Note: We only workaround the missing hover time not the blocked/missing NIN_POPUPOPEN notifications. If we want to workaround
-                // the broken NIN_POPUPOPEN notifications on Win11 the tray icons also send WM_MOUSEMOSE and before NIN_POPUPOPEN existed
-                // XP applications would compare the cursor position in a timer callback to show or hide the popup. (dmex)
+                // a timer to delay the popup for 1 second, then - as XP applications did before NIN_POPUPOPEN existed - compare the
+                // cursor position in the timer callback to decide whether to show it. (dmex)
+                //
+                // Win11 delivers NIN_POPUPOPEN repeatedly during a single hover, and a spurious NIN_POPUPCLOSE mid-hover. Re-arming
+                // on every NIN_POPUPOPEN reset the 1s delay so it never matured; cancelling on every NIN_POPUPCLOSE killed it outright.
+                // So we arm the timer once per hover and let the callback decide from the cursor position, not the open/close edges. (zvirja)
 
                 PopupIconIndex = iconIndex;
                 PopupRegisteredIcon = registeredIcon;
 
-                PhSetTimer(PhMainWndHandle, TIMER_ICON_POPUPOPEN, NFP_ICON_RESTORE_HOVER_DELAY, PhNfpIconShowPopupHoverTimerProc);
+                if (!PopupTimerPending)
+                {
+                    PopupTimerPending = TRUE;
+                    PhSetTimer(PhMainWndHandle, TIMER_ICON_POPUPOPEN, NFP_ICON_RESTORE_HOVER_DELAY, PhNfpIconShowPopupHoverTimerProc);
+                }
             }
             else
             {
@@ -593,9 +600,20 @@ VOID PhNfForwardMessage(
         break;
     case NIN_POPUPCLOSE:
         {
-            PhNfpIconDisablePopupHoverWin11Workaround();
+            if (WindowsVersion >= WINDOWS_11_22H2)
+            {
+                // Do NOT cancel the pending hover-delay timer or clear the popup target here: the shell can fire a
+                // spurious NIN_POPUPCLOSE mid-hover, and cancelling kept the 1s timer from ever maturing. The timer
+                // callback validates the real cursor position before showing. The debounced unpin still dismisses a
+                // shown popup when the user actually leaves. (zvirja)
+                PhPinMiniInformation(MiniInfoIconPinType, -1, 350, 0, NULL, NULL);
+            }
+            else
+            {
+                PhNfpIconDisablePopupHoverWin11Workaround();
 
-            PhPinMiniInformation(MiniInfoIconPinType, -1, 350, 0, NULL, NULL);
+                PhPinMiniInformation(MiniInfoIconPinType, -1, 350, 0, NULL, NULL);
+            }
         }
         break;
     }
@@ -2601,9 +2619,38 @@ VOID PhNfpIconDisablePopupHoverWin11Workaround(
     {
         PopupIconIndex = ULONG_MAX;
         PopupRegisteredIcon = NULL;
+        PopupTimerPending = FALSE;
 
         PhKillTimer(PhMainWndHandle, TIMER_ICON_POPUPOPEN);
     }
+}
+
+// Returns TRUE if the cursor is currently over the given tray icon. The delayed Win11 hover popup
+// validates the real cursor position at timer maturity instead of trusting the (unreliable)
+// NIN_POPUPOPEN/NIN_POPUPCLOSE edges. If the icon rect can't be resolved we assume TRUE so behaviour
+// degrades to "show" (no regression versus the previous edge-only logic). (zvirja)
+static BOOLEAN PhNfpIsCursorOverNotifyIcon(
+    _In_ PPH_NF_ICON Icon
+    )
+{
+    NOTIFYICONIDENTIFIER identifier;
+    RECT iconRectangle;
+    POINT cursorPos;
+
+    memset(&identifier, 0, sizeof(NOTIFYICONIDENTIFIER));
+    identifier.cbSize = sizeof(NOTIFYICONIDENTIFIER);
+    identifier.hWnd = PhMainWndHandle;
+    identifier.uID = Icon->IconId;
+
+    if (PhNfPersistTrayIconPositionEnabled)
+        identifier.guidItem = Icon->IconGuid;
+
+    if (FAILED(Shell_NotifyIconGetRect(&identifier, &iconRectangle)))
+        return TRUE;
+    if (!GetCursorPos(&cursorPos))
+        return TRUE;
+
+    return !!PtInRect(&iconRectangle, cursorPos);
 }
 
 VOID PhNfpIconShowPopupHoverTimerProc(
@@ -2616,9 +2663,14 @@ VOID PhNfpIconShowPopupHoverTimerProc(
     PH_NF_MSG_SHOWMINIINFOSECTION_DATA showMiniInfoSectionData;
     POINT location;
 
+    // One-shot: the delay has elapsed, so disarm before deciding (a fresh hover re-arms it).
+    PopupTimerPending = FALSE;
+    PhKillTimer(PhMainWndHandle, TIMER_ICON_POPUPOPEN);
+
     if (
         PhNfMiniInfoEnabled && !IconDisableHover &&
         PopupIconIndex != ULONG_MAX && PopupRegisteredIcon &&
+        PhNfpIsCursorOverNotifyIcon(PopupRegisteredIcon) &&
         PhNfpGetShowMiniInfoSectionData(PopupIconIndex, PopupRegisteredIcon, &showMiniInfoSectionData)
         )
     {
