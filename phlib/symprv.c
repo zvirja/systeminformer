@@ -1758,10 +1758,11 @@ VOID PhSetSearchPathSymbolProvider(
 #ifdef _WIN64
 
 /**
- * Looks up a dynamic function table for an address.
+ * Looks up a dynamic function table of a specific kind covering an address.
  *
  * \param ProcessHandle Handle to the process.
  * \param Address The address to look up.
+ * \param MatchCallbackTable TRUE to match only callback tables, FALSE to match only direct tables.
  * \param FunctionTableAddress A pointer to a variable that receives the function table address.
  * \param FunctionTable A pointer to a variable that receives the function table.
  * \param OutOfProcessCallbackDllBuffer A buffer for the out-of-process callback DLL path.
@@ -1769,9 +1770,10 @@ VOID PhSetSearchPathSymbolProvider(
  * \param OutOfProcessCallbackDllString A pointer to a variable that receives the callback DLL string.
  * \return STATUS_SUCCESS on success, or an NTSTATUS error code on failure.
  */
-NTSTATUS PhpLookupDynamicFunctionTable(
+NTSTATUS PhpLookupDynamicFunctionTableByType(
     _In_ HANDLE ProcessHandle,
     _In_ ULONG64 Address,
+    _In_ BOOLEAN MatchCallbackTable,
     _Out_opt_ PDYNAMIC_FUNCTION_TABLE *FunctionTableAddress,
     _Out_opt_ PDYNAMIC_FUNCTION_TABLE FunctionTable,
     _Out_writes_bytes_opt_(OutOfProcessCallbackDllBufferSize) PWCHAR OutOfProcessCallbackDllBuffer,
@@ -1790,6 +1792,8 @@ NTSTATUS PhpLookupDynamicFunctionTable(
     SIZE_T numberOfBytesRead;
     ULONG i;
     BOOLEAN foundNull;
+    BOOLEAN isCallbackTable;
+    BOOLEAN tableHasUnwindData;
 
     rtlGetFunctionTableListHead = PhGetDllProcedureAddressZ(L"ntdll.dll", "RtlGetFunctionTableListHead", 0);
 
@@ -1825,7 +1829,15 @@ NTSTATUS PhpLookupDynamicFunctionTable(
             )))
             return status;
 
-        if (Address >= functionTable.MinimumAddress && Address < functionTable.MaximumAddress)
+        isCallbackTable = functionTable.Type == RF_CALLBACK;
+        tableHasUnwindData = functionTable.FunctionTable && functionTable.EntryCount;
+
+        // Match the table kind requested for this pass; on the direct pass also
+        // skip tables that don't point at a RUNTIME_FUNCTION array.
+        if (Address >= functionTable.MinimumAddress &&
+            Address < functionTable.MaximumAddress &&
+            isCallbackTable == MatchCallbackTable &&
+            (MatchCallbackTable || tableHasUnwindData))
         {
             if (OutOfProcessCallbackDllBuffer)
             {
@@ -1897,6 +1909,56 @@ NTSTATUS PhpLookupDynamicFunctionTable(
     }
 
     return STATUS_NOT_FOUND;
+}
+
+/**
+ * Looks up a dynamic function table for an address.
+ *
+ * \param ProcessHandle Handle to the process.
+ * \param Address The address to look up.
+ * \param FunctionTableAddress A pointer to a variable that receives the function table address.
+ * \param FunctionTable A pointer to a variable that receives the function table.
+ * \param OutOfProcessCallbackDllBuffer A buffer for the out-of-process callback DLL path.
+ * \param OutOfProcessCallbackDllBufferSize The size of the buffer.
+ * \param OutOfProcessCallbackDllString A pointer to a variable that receives the callback DLL string.
+ * \return STATUS_SUCCESS on success, or an NTSTATUS error code on failure.
+ */
+NTSTATUS PhpLookupDynamicFunctionTable(
+    _In_ HANDLE ProcessHandle,
+    _In_ ULONG64 Address,
+    _Out_opt_ PDYNAMIC_FUNCTION_TABLE *FunctionTableAddress,
+    _Out_opt_ PDYNAMIC_FUNCTION_TABLE FunctionTable,
+    _Out_writes_bytes_opt_(OutOfProcessCallbackDllBufferSize) PWCHAR OutOfProcessCallbackDllBuffer,
+    _In_ ULONG OutOfProcessCallbackDllBufferSize,
+    _Out_opt_ PUNICODE_STRING OutOfProcessCallbackDllString
+    )
+{
+    NTSTATUS status = STATUS_NOT_FOUND;
+    ULONG pass;
+
+    // .NET 10 registers two dynamic tables for the same JITted code range: a legacy
+    // callback table and a direct RUNTIME_FUNCTION table. The callback can return an
+    // incomplete list, so scan for the direct table first (pass 0) and fall back to
+    // the callback table (pass 1) for older CoreCLR / .NET Framework runtimes.
+
+    for (pass = 0; pass < 2; pass++)
+    {
+        status = PhpLookupDynamicFunctionTableByType(
+            ProcessHandle,
+            Address,
+            /* MatchCallbackTable */ pass != 0,
+            FunctionTableAddress,
+            FunctionTable,
+            OutOfProcessCallbackDllBuffer,
+            OutOfProcessCallbackDllBufferSize,
+            OutOfProcessCallbackDllString
+            );
+
+        if (status != STATUS_NOT_FOUND)
+            return status; // matched, or a hard error worth surfacing
+    }
+
+    return status; // STATUS_NOT_FOUND
 }
 
 /**
