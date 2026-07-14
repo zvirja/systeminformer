@@ -2246,13 +2246,16 @@ ULONG64 __stdcall PhGetModuleBase64(
     _In_ ULONG64 dwAddr
     )
 {
-    ULONG64 base;
+    ULONG64 base = 0;
 #ifdef _WIN64
     DYNAMIC_FUNCTION_TABLE functionTable;
 #endif
 
+    if (SymGetModuleBase64_I)
+        base = SymGetModuleBase64_I(hProcess, dwAddr);
+
 #ifdef _WIN64
-    if (NT_SUCCESS(PhpLookupDynamicFunctionTable(
+    if (base == 0 && NT_SUCCESS(PhpLookupDynamicFunctionTable(
         hProcess,
         dwAddr,
         NULL,
@@ -2264,16 +2267,7 @@ ULONG64 __stdcall PhGetModuleBase64(
     {
         base = functionTable.BaseAddress;
     }
-    else
-    {
-        base = 0;
-    }
-#else
-    base = 0;
 #endif
-
-    if (base == 0 && SymGetModuleBase64_I)
-        base = SymGetModuleBase64_I(hProcess, dwAddr);
 
     return base;
 }
